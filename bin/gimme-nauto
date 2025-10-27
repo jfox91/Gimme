@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+Nautobot CLI tool for gimme
+Usage: gimme nauto <command> <device>
+"""
+
+import sys
+import os
+from pynautobot import api
+import json
+
+# Configuration
+NAUTOBOT_URL = os.environ.get('NAUTOBOT_URL')
+NAUTOBOT_TOKEN = os.environ.get('NAUTOBOT_TOKEN')
+
+if not NAUTOBOT_URL or not NAUTOBOT_TOKEN:
+    print("Error: NAUTOBOT_URL and NAUTOBOT_TOKEN environment variables must be set", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Add to ~/.bashrc:", file=sys.stderr)
+    print('  export NAUTOBOT_URL="https://nautobot.example.com"', file=sys.stderr)
+    print('  export NAUTOBOT_TOKEN="your-token"', file=sys.stderr)
+    sys.exit(1)
+
+def usage():
+    print("""Usage: gimme nauto <command> <device>
+
+Commands:
+  status <device>      Show device status, rack location, and notes
+  info <device>        Show full device information
+  location <device>    Show device location (site/rack/position)
+  ip <device>          Show device IP addresses
+  interfaces <device>  Show device interfaces
+  all <device>         Show all information
+
+Examples:
+  gimme nauto status s563
+  gimme nauto info a3000
+  gimme nauto ip s563
+  gimme nauto interfaces s563
+""")
+    sys.exit(1)
+
+def connect_nautobot():
+    """Connect to Nautobot API"""
+    try:
+        nb = api(url=NAUTOBOT_URL, token=NAUTOBOT_TOKEN)
+        nb.version  # Test connection
+        return nb
+    except Exception as e:
+        print(f"Error connecting to Nautobot: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def find_device(nb, device_name):
+    """Find device by name"""
+    try:
+        device = nb.dcim.devices.get(name=device_name)
+        if not device:
+            print(f"Error: Device '{device_name}' not found in Nautobot", file=sys.stderr)
+            sys.exit(1)
+        return device
+    except Exception as e:
+        print(f"Error finding device: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def show_status(device, device_name):
+    """Show device status, rack location, and notes"""
+    status = device.status if device.status else "Unknown"
+    print(f"{device_name}: {status}")
+    
+    # Show rack location
+    if hasattr(device, 'rack') and device.rack:
+        rack_info = f"  Rack: {device.rack.name}"
+        if hasattr(device, 'position') and device.position:
+            rack_info += f" (U{device.position})"
+        print(rack_info)
+    else:
+        print(f"  Rack: Not racked")
+    
+    # Show site if available
+    if hasattr(device, 'site') and device.site:
+        print(f"  Site: {device.site.name}")
+    
+    # Show location within site if available
+    if hasattr(device, 'location') and device.location:
+        print(f"  Location: {device.location.name}")
+    
+    # Show primary IP
+    if hasattr(device, 'primary_ip4') and device.primary_ip4:
+        print(f"  Primary IP: {device.primary_ip4.address}")
+    
+    # Show model
+    if hasattr(device, 'device_type'):
+        print(f"  Model: {device.device_type.model}")
+    
+    # Show role
+    if hasattr(device, 'device_role'):
+        print(f"  Role: {device.device_role.name}")
+    
+    # Show notes/comments if any exist
+    notes = None
+    if hasattr(device, 'comments') and device.comments:
+        notes = device.comments
+    elif hasattr(device, 'notes') and device.notes:
+        notes = device.notes
+    
+    if notes:
+        print(f"  Notes:")
+        # Handle multi-line notes with proper indentation
+        for line in notes.strip().split('\n'):
+            print(f"    {line}")
+
+def show_info(device, device_name):
+    """Show full device info"""
+    print(f"Device: {device_name}")
+    print(f"  Status: {device.status if device.status else 'Unknown'}")
+    print(f"  Site: {device.site.name if device.site else 'N/A'}")
+    
+    if hasattr(device, 'location') and device.location:
+        print(f"  Location: {device.location.name}")
+    
+    if hasattr(device, 'rack') and device.rack:
+        print(f"  Rack: {device.rack.name}")
+    
+    if hasattr(device, 'position') and device.position:
+        print(f"  Position: {device.position}")
+    
+    if hasattr(device, 'device_type'):
+        print(f"  Manufacturer: {device.device_type.manufacturer.name}")
+        print(f"  Model: {device.device_type.model}")
+    
+    if hasattr(device, 'device_role'):
+        print(f"  Role: {device.device_role.name}")
+    
+    if hasattr(device, 'serial') and device.serial:
+        print(f"  Serial: {device.serial}")
+    
+    if hasattr(device, 'asset_tag') and device.asset_tag:
+        print(f"  Asset Tag: {device.asset_tag}")
+    
+    if hasattr(device, 'primary_ip4') and device.primary_ip4:
+        print(f"  Primary IPv4: {device.primary_ip4.address}")
+    
+    if hasattr(device, 'primary_ip6') and device.primary_ip6:
+        print(f"  Primary IPv6: {device.primary_ip6.address}")
+    
+    if hasattr(device, 'platform') and device.platform:
+        print(f"  Platform: {device.platform.name}")
+    
+    if hasattr(device, 'comments') and device.comments:
+        print(f"  Comments: {device.comments}")
+
+def show_location(device, device_name):
+    """Show device location"""
+    print(f"{device_name} location:")
+    print(f"  Site: {device.site.name if device.site else 'N/A'}")
+    
+    if hasattr(device, 'location') and device.location:
+        print(f"  Location: {device.location.name}")
+    
+    if hasattr(device, 'rack') and device.rack:
+        print(f"  Rack: {device.rack.name}")
+        if hasattr(device, 'position') and device.position:
+            print(f"  Position: U{device.position}")
+    else:
+        print(f"  Rack: Not racked")
+
+def show_ips(nb, device, device_name):
+    """Show device IP addresses"""
+    print(f"{device_name} IP addresses:")
+    
+    # Get all interfaces for this device
+    interfaces = nb.dcim.interfaces.filter(device=device_name)
+    
+    found_ips = False
+    for interface in interfaces:
+        # Get IP addresses for this interface
+        ip_addresses = nb.ipam.ip_addresses.filter(interface_id=interface.id)
+        
+        for ip in ip_addresses:
+            found_ips = True
+            print(f"  {interface.name}: {ip.address}")
+    
+    if not found_ips:
+        print("  No IP addresses found")
+
+def show_interfaces(nb, device, device_name):
+    """Show device interfaces"""
+    print(f"{device_name} interfaces:")
+    
+    interfaces = nb.dcim.interfaces.filter(device=device_name)
+    
+    if not interfaces:
+        print("  No interfaces found")
+        return
+    
+    for interface in interfaces:
+        status = interface.enabled
+        enabled_str = "enabled" if status else "disabled"
+        
+        # Get connection status
+        connected = ""
+        if hasattr(interface, 'connected_endpoint') and interface.connected_endpoint:
+            connected = f" -> {interface.connected_endpoint}"
+        
+        # Get IP if exists
+        ips = nb.ipam.ip_addresses.filter(interface_id=interface.id)
+        ip_str = ""
+        if ips:
+            ip_list = [ip.address for ip in ips]
+            ip_str = f" [{', '.join(ip_list)}]"
+        
+        print(f"  {interface.name}: {interface.type.value} ({enabled_str}){ip_str}{connected}")
+
+def show_all(nb, device, device_name):
+    """Show all information"""
+    show_info(device, device_name)
+    print("")
+    show_location(device, device_name)
+    print("")
+    show_ips(nb, device, device_name)
+    print("")
+    show_interfaces(nb, device, device_name)
+
+def main():
+    if len(sys.argv) < 3:
+        usage()
+    
+    command = sys.argv[1].lower()
+    device_name = sys.argv[2]
+    
+    # Connect to Nautobot
+    nb = connect_nautobot()
+    
+    # Find device
+    device = find_device(nb, device_name)
+    
+    # Execute command
+    if command == 'status':
+        show_status(device, device_name)
+    elif command == 'info':
+        show_info(device, device_name)
+    elif command == 'location':
+        show_location(device, device_name)
+    elif command == 'ip':
+        show_ips(nb, device, device_name)
+    elif command == 'interfaces':
+        show_interfaces(nb, device, device_name)
+    elif command == 'all':
+        show_all(nb, device, device_name)
+    else:
+        print(f"Error: Unknown command '{command}'", file=sys.stderr)
+        usage()
+
+if __name__ == '__main__':
+    main()

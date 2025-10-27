@@ -1,0 +1,19 @@
+# GIMME Configuration Example
+# Copy this to ~/.config/gimme/config and edit
+
+# Required: Matchbox groups directory
+export MATCHBOX_DIR="$HOME/matchbox/groups"
+
+# Optional: Nautobot integration
+export NAUTOBOT_URL="https://nautobot.example.com"
+export NAUTOBOT_TOKEN="your-api-token-here"
+
+# Optional: Kubectl timeout (default: 5s)
+export GIMME_KUBECTL_TIMEOUT="10s"
+
+# Optional: SSH settings
+export GIMME_SSH_USER="$USER"
+export GIMME_SSH_KEY="~/.ssh/id_rsa"
+
+# Optional: Debug mode
+# export GIMME_DEBUG=1

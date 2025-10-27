@@ -1,0 +1,880 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# Path to matchbox groups directory
+MATCHBOX_DIR="${MATCHBOX_DIR:-$HOME/matchbox/groups}"
+
+usage() {
+  cat <<'USAGE'
+Usage: gimme <FIELD|list-fields|where|hardware|search|find|status|k8s|offline|oldest|nauto|nut> <NODE|PATTERN|VALUE> [NODE2 NODE3 ...]
+
+Examples:
+  gimme mac a2550
+  gimme ip a2550 a2551 a2552
+  gimme cluster a2550
+  gimme all a2550
+  gimme where a2550
+  gimme hardware a2550
+  gimme status a3000
+  gimme k8s a3000
+  gimme k8s a{3000..3020}
+  gimme k8s --not v1.21.14
+  gimme k8s --not v1.21.14 --context aus1p16
+  gimme offline
+  gimme offline --context aus1p16
+  gimme oldest
+  gimme oldest --context aus1p16
+  gimme oldest --limit 20
+  gimme nauto [args...]
+  gimme nut
+  gimme list-fields
+  gimme search rack=r12
+  gimme search cluster=prod
+  gimme find ip 199.45.163.166
+  gimme find mac 3c:ec:ef:fa:11:88
+  gimme find hostname myserver.example.com
+
+Notes:
+- Multiple nodes can be queried at once (except for 'all', 'where', 'hardware', 'status')
+- 'all' prints the full pretty JSON
+- 'where' shows which pod/file the node was found in
+- 'hardware' SSHes to the node and runs: sudo lshw -short
+- 'status' shows Kubernetes node status via kubectl (uses .metadata.pod as context)
+- 'k8s' shows Kubernetes version for node(s)
+- 'k8s --not VERSION' shows all nodes NOT running specified version
+- 'offline' shows all nodes with NotReady status across all clusters
+- 'oldest' shows nodes sorted by age (oldest first), defaults to top 10
+- 'nauto' passes all arguments to gimme-nauto script
+- 'nut' shows a squirrel (obviously)
+- 'search' finds all nodes matching a label (format: key=value)
+- 'find' does reverse lookup - finds node(s) by field value
+- Fields map to JSON via jq; add new ones in the FIELDS map below
+- SSH user can be set with GIMME_SSH_USER (defaults to $USER)
+- SSH key can be set with GIMME_SSH_KEY (optional)
+- Kubectl timeout can be set with GIMME_KUBECTL_TIMEOUT (defaults to 5s)
+- Set GIMME_DEBUG=1 for verbose kubectl output
+USAGE
+  exit 1
+}
+
+# Field → jq expression map
+declare -A FIELDS=(
+  [mac]='.selector.mac'
+  [ip]='(.metadata.ip
+         // .metadata.public_ip
+         // (.metadata.networkd_address | split("/")[0])
+         // .metadata.cluster_vip
+         // empty)'
+  [public_ip]='.metadata.public_ip'
+  [hostname]='.metadata.hostname'
+  [role]='.metadata.role'
+  [datacenter]='.metadata.datacenter'
+  [pod]='.metadata.pod'
+  [cluster]='(.metadata.labels // []) | map(select(startswith("cluster="))) | .[0] // "" | if . == "" then "" else (split("=")[1] // "") end'
+  [rack]='(.metadata.labels // []) | map(select(startswith("rack="))) | .[0] // "" | if . == "" then "" else (split("=")[1] // "") end'
+  [model]='(.metadata.labels // []) | map(select(startswith("model="))) | .[0] // "" | if . == "" then "" else (split("=")[1] // "") end'
+  [networkd_address]='.metadata.networkd_address'
+  [networkd_gateway]='.metadata.networkd_gateway'
+  [cluster_vip]='.metadata.cluster_vip'
+  [asn]='.metadata.asn'
+  [kubernetes_role]='.metadata.kubernetes_role'
+  [ipmi]='.metadata.ipmi'
+  [kubernetes_version]='.metadata.kubernetes_version'
+  [flatcar_version]='.metadata.flatcar_version'
+)
+
+show_nut() {
+  cat << 'NUT'
+                        ████████  ██████████                                                    
+                    ████▒▒▒▒▒▒████▒▒▒▒▒▒▒▒▒▒██                ████████████████████              
+                  ▒▒░░▒▒▒▒▒▒██▒▒▓▓▓▓██████▒▒██            ▒▒▓▓░░░░░░▒▒▓▓▓▓▓▓▓▓▓▓▓▓██▓▓          
+                  ██░░▒▒▒▒██▒▒▒▒██░░░░░░░░██▒▒██        ██░░░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░██        
+                ██░░▒▒▒▒▒▒██░░██░░░░░░░░░░██▒▒██      ██░░░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░▓▓      
+                ██░░▒▒▒▒██░░░░██░░░░░░░░░░██░░██      ██░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░██    
+                ██░░▒▒▒▒██░░██░░░░░░░░░░░░██░░██    ██░░░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░██  
+                ██░░██████░░██░░░░░░░░░░░░██░░██    ██░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░██  
+                ████▒▒▓▓██░░██░░░░░░░░░░▓▓░░▓▓      ██░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░██
+            ████▒▒▒▒▒▒▒▒██░░██████░░░░██░░░░██    ██░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░██
+          ██▒▒▒▒▒▒░░░░░░░░░░░░░░░░████░░░░██      ██░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░██
+        ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░██▒▒██    ██░░░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░██
+      ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░██░░▒▒▒▒██  ██░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░░░██
+    ██░░░░░░░░░░░░████████░░░░░░░░░░░░░░░░░░▒▒▒▒████░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░░░██
+    ██░░░░░░░░░░▓▓████░░██░░░░░░░░░░░░░░░░░░░░▒▒████░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░░░██
+  ██░░░░░░░░░░░░██▓▓▓▓▓▓██░░░░░░░░░░░░░░░░░░░░░░▓▓██░░▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░░░██
+  ██      ░░░░░░████████░░░░░░░░░░░░░░░░░░░░░░░░░░██░░▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░    ░░░░░░██  
+██████      ░░░░░░░░░░░░░░░░░░░░░░░░░░░░██░░░░░░░░░░██▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░    ██    ░░██  
+██▒▒██      ░░░░░░░░░░░░░░░░░░░░░░░░░░░░██░░░░░░░░░░██▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░    ██    ██    
+██░░██        ░░░░░░░░░░░░░░░░░░░░░░░░██░░░░░░░░░░░░░░██▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░    ██  ██      
+████░░        ░░░░░░░░░░░░░░░░░░░░░░░░██░░░░░░░░░░░░░░██▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░    ████░░      
+██░░            ░░      ░░░░░░░░░░░░▓▓░░░░░░░░░░░░░░░░░░██▒▒▒▒▒▒░░░░░░░░░░░░░░░░    ██          
+  ██                            ████  ░░░░░░░░░░░░░░░░░░██▒▒▒▒▒▒░░░░░░░░░░░░░░      ██          
+    ██                    ██████        ░░██░░░░░░░░██░░██▒▒▒▒▒▒░░░░░░░░░░░░░░      ██          
+      ▒▒██████▓▓████▓▓▓▓▓▓░░░░░░        ░░██░░░░░░░░██░░██▒▒▒▒▒▒░░░░░░░░░░░░░░      ██          
+                    ░░██████▓▓████    ░░  ██░░░░░░░░██░░░░██▒▒▒▒░░░░░░░░░░░░░░      ██          
+                    ██▒▒░░▒▒░░▒▒░░██      ██░░░░░░██░░░░░░██▒▒▒▒░░░░░░░░░░░░░░      ██          
+                  ▓▓▒▒▒▒░░▒▒░░▒▒░░▒▒▓▓  ▓▓░░░░░░░░██░░░░░░██▒▒▒▒░░░░░░░░░░░░░░    ▓▓░░          
+                  ██░░▒▒░░▒▒░░▒▒░░░░████░░░░░░░░██░░░░░░░░██▒▒▒▒░░░░░░░░░░░░      ██            
+                  ██░░▒▒░░▒▒░░░░░░██░░░░░░░░████░░░░░░░░░░██▒▒▒▒░░░░░░░░░░░░      ██            
+                  ██░░▒▒░░▒▒░░░░░░▓▓░░░░████    ░░░░░░░░░░░░██▒▒░░░░░░░░░░░░      ██            
+                  ██░░░░░░▒▒░░░░░░▓▓▓▓██          ░░░░░░░░░░▓▓▒▒░░░░░░░░░░      ██              
+                  ██░░░░░░▒▒░░░░░░░░██        ████████░░░░░░██▒▒░░░░░░░░░░      ██              
+              ██████░░▒▒░░▒▒░░▒▒░░░░██    ████░░░░░░░░░░░░░░░░██░░░░░░░░░░      ██              
+            ██░░░░██░░▒▒░░▒▒░░▒▒░░██    ██░░░░░░░░░░░░░░░░░░░░██░░░░░░░░      ██                
+          ██░░░░░░██░░░░░░▒▒░░▒▒░░██  ██░░░░░░░░░░░░░░░░░░░░░░██░░░░░░░░    ░░██                
+          ██░░░░░░██░░░░░░▒▒░░▒▒░░██  ██░░░░░░░░░░░░░░░░░░░░░░▒▒▓▓░░░░░░    ██                  
+          ██░░░░░░░░▓▓░░░░▒▒░░▒▒▓▓░░  ██░░░░░░░░░░░░░░░░░░░░░░░░██░░░░      ██                  
+          ██░░░░░░░░██░░░░░░░░▒▒██    ██░░░░░░░░░░░░░░░░░░░░░░░░██░░░░    ██                    
+          ██░░░░░░░░░░██░░░░░░██      ██░░░░░░░░░░░░░░░░░░░░░░░░██░░      ██                    
+          ██░░░░░░░░░░░░██▓▓▓▓░░      ██░░░░░░░░░░░░░░░░░░░░░░░░██░░    ▓▓░░                    
+          ██░░░░░░░░░░░░░░░░░░        ██░░░░░░░░░░░░░░░░░░░░░░░░██    ██                        
+            ██░░░░░░░░░░░░░░            ██░░░░░░░░░░░░░░░░░░░░██    ██                          
+              ████░░░░░░░░░░░░            ████░░░░░░░░░░░░░░░░██  ██                            
+          ▓▓▓▓██████▓▓████░░░░░░      ▓▓▓▓██████▓▓▓▓░░░░░░░░░░▓▓▓▓                              
+        ▒▒▒▒▒▒░░░░░░██▒▒▒▒░░░░░░░░░░██▒▒▒▒░░░░░░░░▒▒░░░░░░░░░░▓▓                                
+        ██░░░░░░░░░░░░░░░░░░░░░░░░░░██░░░░░░░░░░░░░░░░░░░░░░▓▓                                  
+        ██████████████████████▓▓▓▓████▓▓▓▓██████▓▓▓▓▓▓██▓▓▓▓██                                  
+NUT
+}
+
+list_fields() {
+  printf '%s\n' "${!FIELDS[@]}" | sort
+}
+
+# Convert age string to days for sorting
+age_to_days() {
+  local age="$1"
+  local days=0
+  
+  # Parse formats like: 5y104d, 2y256d, 675d, 47d
+  if [[ "$age" =~ ([0-9]+)y([0-9]+)d ]]; then
+    # Years and days: 5y104d
+    local years="${BASH_REMATCH[1]}"
+    local extra_days="${BASH_REMATCH[2]}"
+    days=$((years * 365 + extra_days))
+  elif [[ "$age" =~ ([0-9]+)y ]]; then
+    # Just years: 5y
+    local years="${BASH_REMATCH[1]}"
+    days=$((years * 365))
+  elif [[ "$age" =~ ([0-9]+)d ]]; then
+    # Just days: 675d
+    days="${BASH_REMATCH[1]}"
+  elif [[ "$age" =~ ([0-9]+)h ]]; then
+    # Hours (less than a day): 23h -> 0 days
+    days=0
+  fi
+  
+  echo "$days"
+}
+
+# ---- locate node file intelligently ----
+find_json_for_node() {
+  local node="$1"
+  local -a hits=()
+  local hit poddir filepod
+
+  # Collect all files literally named <node>.json
+  while IFS= read -r -d '' hit; do
+    hits+=("$hit")
+  done < <(find "$MATCHBOX_DIR" -type f -name "${node}.json" -print0 2>/dev/null || true)
+
+  # Prefer a hit whose parent dir equals .metadata.pod
+  for hit in "${hits[@]}"; do
+    poddir="$(basename "$(dirname "$hit")")"
+    filepod="$(jq -r '.metadata.pod // empty' "$hit" 2>/dev/null || true)"
+    if [[ -n "$filepod" && "$filepod" == "$poddir" ]]; then
+      printf '%s\n' "$hit"
+      return 0
+    fi
+  done
+
+  # If any hit exists, use the first one
+  if [[ ${#hits[@]} -gt 0 ]]; then
+    printf '%s\n' "${hits[0]}"
+    return 0
+  fi
+
+  # Fallback: find JSON where .metadata.hostname == node
+  while IFS= read -r -d '' hit; do
+    if jq -e --arg n "$node" '.metadata.hostname == $n' "$hit" >/dev/null 2>&1; then
+      printf '%s\n' "$hit"
+      return 0
+    fi
+  done < <(find "$MATCHBOX_DIR" -type f -name '*.json' -print0 2>/dev/null || true)
+
+  return 1
+}
+
+pretty_all() {
+  local file="$1" node="$2"
+  printf 'Node: %s (file: %s)\n' "$node" "$file"
+  jq . "$file"
+}
+
+where_node() {
+  local file="$1"
+  local folder_pod real_pod
+  folder_pod="$(basename "$(dirname "$file")")"
+  real_pod="$(jq -r '.metadata.pod // "unknown"' "$file" 2>/dev/null || echo unknown)"
+  printf 'Found at: %s\nFolder pod: %s\nMetadata pod: %s\n' "$file" "$folder_pod" "$real_pod"
+}
+
+# Choose best SSH host from JSON metadata
+pick_ssh_host() {
+  local file="$1"
+  jq -r '
+    [
+      .metadata.ssh_host,
+      .metadata.public_ip,
+      (.metadata.networkd_address | split("/")[0]),
+      .metadata.hostname,
+      .metadata.cluster_vip
+    ]
+    | map(select(. != null and . != ""))
+    | .[0] // empty
+  ' "$file"
+}
+
+ssh_lshw() {
+  local file="$1"
+  local node="$2"
+  local host
+  host="$(pick_ssh_host "$file" || true)"
+
+  if [[ -z "${host:-}" ]]; then
+    echo "Error: No suitable SSH host found in metadata for '$node'." >&2
+    echo "Looked at: metadata.ssh_host, public_ip, networkd_address, hostname, cluster_vip" >&2
+    return 1
+  fi
+
+  local user="${GIMME_SSH_USER:-$USER}"
+  local -a ssh_opts=(-tt -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+  
+  # Add SSH key if specified
+  [[ -n "${GIMME_SSH_KEY:-}" ]] && ssh_opts+=(-i "$GIMME_SSH_KEY")
+
+  echo "Connecting to ${user}@${host} to run: sudo lshw -short"
+  if ! ssh "${ssh_opts[@]}" "${user}@${host}" \
+      'sudo -n lshw -short 2>/dev/null || { ec=$?; echo "sudo -n failed (password likely required). Trying with prompt..."; sudo lshw -short; exit $ec; }'
+  then
+    echo
+    echo "Remote command failed. If sudo prompts for a password and you want this non-interactive:"
+    echo "  - Configure passwordless sudo for your user on the node, or"
+    echo "  - Run manually: ssh ${user}@${host} 'sudo lshw -short'"
+    return 1
+  fi
+}
+
+kubectl_status() {
+  local file="$1"
+  local node="$2"
+  local context
+  local timeout
+  local output
+  local stderr_file
+  local exit_code
+  local stderr_content
+  
+  # Get the pod/context from metadata
+  context=$(jq -r '.metadata.pod // empty' "$file" 2>/dev/null || true)
+  
+  if [[ -z "$context" ]]; then
+    echo "Error: No .metadata.pod found for node '$node'" >&2
+    echo "Cannot determine kubectl context" >&2
+    return 1
+  fi
+  
+  timeout="${GIMME_KUBECTL_TIMEOUT:-5s}"
+  
+  if [[ "${GIMME_DEBUG:-0}" == "1" ]]; then
+    echo "Debug: Using context '$context' for node '$node'" >&2
+    echo "Debug: Running: timeout $timeout kubectl get no --context $context --request-timeout=$timeout" >&2
+  fi
+  
+  # Run kubectl get nodes with timeout
+  stderr_file=$(mktemp)
+  
+  if ! output=$(timeout "$timeout" kubectl get no --context "$context" --request-timeout="$timeout" 2>"$stderr_file"); then
+    exit_code=$?
+    stderr_content=$(<"$stderr_file")
+    rm -f "$stderr_file"
+    
+    if [[ $exit_code -eq 124 ]]; then
+      echo "Error: kubectl command timed out after $timeout" >&2
+      echo "Context: $context" >&2
+      echo "Try increasing timeout: GIMME_KUBECTL_TIMEOUT=30s gimme status $node" >&2
+    else
+      echo "Error: kubectl command failed for context '$context'" >&2
+      if [[ -n "$stderr_content" ]]; then
+        echo "kubectl error output:" >&2
+        echo "$stderr_content" >&2
+      fi
+      echo "" >&2
+      echo "Try manually: kubectl get no --context $context" >&2
+      echo "Or check if you need VPN access to the cluster" >&2
+    fi
+    return 1
+  fi
+  
+  rm -f "$stderr_file"
+  
+  # Grep for the node
+  if ! echo "$output" | grep "^${node}\\s"; then
+    echo "Error: Node '$node' not found in context '$context'" >&2
+    echo "Available nodes:" >&2
+    echo "$output" | tail -n +2 | awk '{print "  " $1}' >&2
+    return 1
+  fi
+}
+
+kubectl_k8s_version() {
+  local file="$1"
+  local node="$2"
+  local context
+  local timeout
+  local output
+  local stderr_file
+  local exit_code
+  local stderr_content
+  local version
+  
+  # Get the pod/context from metadata
+  context=$(jq -r '.metadata.pod // empty' "$file" 2>/dev/null || true)
+  
+  if [[ -z "$context" ]]; then
+    echo "${node}: Error - No .metadata.pod found" >&2
+    return 1
+  fi
+  
+  timeout="${GIMME_KUBECTL_TIMEOUT:-5s}"
+  
+  # Run kubectl get nodes with timeout
+  stderr_file=$(mktemp)
+  
+  if ! output=$(timeout "$timeout" kubectl get no --context "$context" --request-timeout="$timeout" 2>"$stderr_file"); then
+    exit_code=$?
+    stderr_content=$(<"$stderr_file")
+    rm -f "$stderr_file"
+    
+    if [[ $exit_code -eq 124 ]]; then
+      echo "${node}: Error - kubectl timeout" >&2
+    else
+      echo "${node}: Error - kubectl failed for context '$context'" >&2
+    fi
+    return 1
+  fi
+  
+  rm -f "$stderr_file"
+  
+  # Extract version for this node
+  version=$(echo "$output" | awk -v node="^${node}" '$1 ~ node {print $NF}')
+  
+  if [[ -z "$version" ]]; then
+    echo "${node}: Not found in cluster" >&2
+    return 1
+  fi
+  
+  echo "${node}: ${version}"
+  return 0
+}
+
+kubectl_k8s_scan() {
+  local exclude_version="$1"
+  local filter_context="${2:-}"
+  local timeout="${GIMME_KUBECTL_TIMEOUT:-5s}"
+  local found=0
+  
+  echo "Scanning all nodes for versions NOT matching: $exclude_version"
+  if [[ -n "$filter_context" ]]; then
+    echo "Filtering by context: $filter_context"
+  fi
+  echo "---"
+  
+  # Get unique contexts from all JSON files
+  declare -A contexts
+  while IFS= read -r -d '' file; do
+    local ctx
+    ctx=$(jq -r '.metadata.pod // empty' "$file" 2>/dev/null || true)
+    if [[ -n "$ctx" ]]; then
+      # If filter_context is set, only include matching contexts
+      if [[ -z "$filter_context" || "$ctx" == "$filter_context" ]]; then
+        contexts["$ctx"]=1
+      fi
+    fi
+  done < <(find "$MATCHBOX_DIR" -type f -name '*.json' -print0 2>/dev/null || true)
+  
+  # Query each context
+  for context in "${!contexts[@]}"; do
+    if [[ "${GIMME_DEBUG:-0}" == "1" ]]; then
+      echo "Debug: Checking context '$context'" >&2
+    fi
+    
+    local output
+    local stderr_file
+    stderr_file=$(mktemp)
+    
+    if output=$(timeout "$timeout" kubectl get no --context "$context" --request-timeout="$timeout" 2>"$stderr_file"); then
+      # Parse output and show nodes with different versions
+      while IFS= read -r line; do
+        # Skip header
+        [[ "$line" =~ ^NAME ]] && continue
+        
+        local node_name version
+        node_name=$(echo "$line" | awk '{print $1}')
+        version=$(echo "$line" | awk '{print $NF}')
+        
+        if [[ "$version" != "$exclude_version" ]]; then
+          found=$((found + 1))
+          printf '%s (context: %s): %s\n' "$node_name" "$context" "$version"
+        fi
+      done <<< "$output"
+    else
+      if [[ "${GIMME_DEBUG:-0}" == "1" ]]; then
+        echo "Debug: Failed to query context '$context'" >&2
+        cat "$stderr_file" >&2
+      fi
+    fi
+    
+    rm -f "$stderr_file"
+  done
+  
+  echo "---"
+  echo "Found $found node(s) NOT running $exclude_version"
+  
+  return 0
+}
+
+kubectl_offline_scan() {
+  local filter_context="${1:-}"
+  local timeout="${GIMME_KUBECTL_TIMEOUT:-5s}"
+  local found=0
+  
+  echo "Scanning all nodes for NotReady status"
+  if [[ -n "$filter_context" ]]; then
+    echo "Filtering by context: $filter_context"
+  fi
+  echo "---"
+  
+  # Get unique contexts from all JSON files
+  declare -A contexts
+  while IFS= read -r -d '' file; do
+    local ctx
+    ctx=$(jq -r '.metadata.pod // empty' "$file" 2>/dev/null || true)
+    if [[ -n "$ctx" ]]; then
+      # If filter_context is set, only include matching contexts
+      if [[ -z "$filter_context" || "$ctx" == "$filter_context" ]]; then
+        contexts["$ctx"]=1
+      fi
+    fi
+  done < <(find "$MATCHBOX_DIR" -type f -name '*.json' -print0 2>/dev/null || true)
+  
+  # Query each context
+  for context in "${!contexts[@]}"; do
+    if [[ "${GIMME_DEBUG:-0}" == "1" ]]; then
+      echo "Debug: Checking context '$context'" >&2
+    fi
+    
+    local output
+    local stderr_file
+    stderr_file=$(mktemp)
+    
+    if output=$(timeout "$timeout" kubectl get no --context "$context" --request-timeout="$timeout" 2>"$stderr_file"); then
+      # Parse output and show nodes that have "NotReady" in their status
+      while IFS= read -r line; do
+        # Skip header
+        [[ "$line" =~ ^NAME ]] && continue
+        
+        local node_name status roles age version
+        node_name=$(echo "$line" | awk '{print $1}')
+        status=$(echo "$line" | awk '{print $2}')
+        roles=$(echo "$line" | awk '{print $3}')
+        age=$(echo "$line" | awk '{print $4}')
+        version=$(echo "$line" | awk '{print $5}')
+        
+        # Check if status contains "NotReady"
+        if [[ "$status" == *"NotReady"* ]]; then
+          found=$((found + 1))
+          printf '%s (context: %s): %s  %s  %s  %s\n' "$node_name" "$context" "$status" "$roles" "$age" "$version"
+        fi
+      done <<< "$output"
+    else
+      if [[ "${GIMME_DEBUG:-0}" == "1" ]]; then
+        echo "Debug: Failed to query context '$context'" >&2
+        cat "$stderr_file" >&2
+      fi
+    fi
+    
+    rm -f "$stderr_file"
+  done
+  
+  echo "---"
+  echo "Found $found node(s) with NotReady status"
+  
+  return 0
+}
+
+kubectl_oldest_scan() {
+  local filter_context="${1:-}"
+  local limit="${2:-10}"
+  local timeout="${GIMME_KUBECTL_TIMEOUT:-5s}"
+  
+  echo "Finding oldest nodes in Kubernetes clusters (limit: $limit)"
+  if [[ -n "$filter_context" ]]; then
+    echo "Filtering by context: $filter_context"
+  fi
+  echo "---"
+  
+  # Get unique contexts from all JSON files
+  declare -A contexts
+  while IFS= read -r -d '' file; do
+    local ctx
+    ctx=$(jq -r '.metadata.pod // empty' "$file" 2>/dev/null || true)
+    if [[ -n "$ctx" ]]; then
+      # If filter_context is set, only include matching contexts
+      if [[ -z "$filter_context" || "$ctx" == "$filter_context" ]]; then
+        contexts["$ctx"]=1
+      fi
+    fi
+  done < <(find "$MATCHBOX_DIR" -type f -name '*.json' -print0 2>/dev/null || true)
+  
+  # Temporary file to collect all nodes with ages
+  local tmpfile
+  tmpfile=$(mktemp)
+  
+  # Query each context
+  for context in "${!contexts[@]}"; do
+    if [[ "${GIMME_DEBUG:-0}" == "1" ]]; then
+      echo "Debug: Checking context '$context'" >&2
+    fi
+    
+    local output
+    local stderr_file
+    stderr_file=$(mktemp)
+    
+    if output=$(timeout "$timeout" kubectl get no --context "$context" --request-timeout="$timeout" 2>"$stderr_file"); then
+      # Parse output and collect all nodes with their ages
+      while IFS= read -r line; do
+        # Skip header
+        [[ "$line" =~ ^NAME ]] && continue
+        
+        local node_name status roles age version
+        node_name=$(echo "$line" | awk '{print $1}')
+        status=$(echo "$line" | awk '{print $2}')
+        roles=$(echo "$line" | awk '{print $3}')
+        age=$(echo "$line" | awk '{print $4}')
+        version=$(echo "$line" | awk '{print $5}')
+        
+        # Convert age to days for sorting
+        local days
+        days=$(age_to_days "$age")
+        
+        # Write to temp file: days|node_name|context|status|roles|age|version
+        echo "${days}|${node_name}|${context}|${status}|${roles}|${age}|${version}" >> "$tmpfile"
+      done <<< "$output"
+    else
+      if [[ "${GIMME_DEBUG:-0}" == "1" ]]; then
+        echo "Debug: Failed to query context '$context'" >&2
+        cat "$stderr_file" >&2
+      fi
+    fi
+    
+    rm -f "$stderr_file"
+  done
+  
+  # Sort by days (descending) and show top N
+  sort -t'|' -k1 -rn "$tmpfile" | head -n "$limit" | while IFS='|' read -r days node_name context status roles age version; do
+    printf '%s (context: %s): %s  %s  %s  %s\n' "$node_name" "$context" "$status" "$roles" "$age" "$version"
+  done
+  
+  rm -f "$tmpfile"
+  
+  echo "---"
+  echo "Showing top $limit oldest nodes"
+  
+  return 0
+}
+
+search_nodes() {
+  local pattern="$1"
+  
+  # Validate pattern format
+  if [[ ! "$pattern" =~ ^[^=]+=[^=]+$ ]]; then
+    echo "Error: Search pattern must be in format 'key=value'" >&2
+    echo "Example: gimme search rack=r12" >&2
+    return 1
+  fi
+  
+  local label="$pattern"
+  local found=0
+  
+  echo "Searching for nodes with label: $label"
+  echo "---"
+  
+  while IFS= read -r -d '' file; do
+    # Check if this file contains the label
+    if jq -e --arg lbl "$label" '
+      (.metadata.labels // []) | any(. == $lbl)
+    ' "$file" >/dev/null 2>&1; then
+      found=$((found + 1))
+      local filename
+      filename=$(basename "$file" .json)
+      local hostname
+      hostname=$(jq -r '.metadata.hostname // "unknown"' "$file" 2>/dev/null)
+      local pod
+      pod=$(jq -r '.metadata.pod // "unknown"' "$file" 2>/dev/null)
+      printf '%s (hostname: %s, pod: %s, file: %s)\n' "$filename" "$hostname" "$pod" "$file"
+    fi
+  done < <(find "$MATCHBOX_DIR" -type f -name '*.json' -print0 2>/dev/null || true)
+  
+  echo "---"
+  echo "Found $found node(s) matching '$label'"
+  
+  return 0
+}
+
+find_by_field() {
+  local field="$1"
+  local value="$2"
+  
+  # Validate field exists
+  if [[ -z "${FIELDS[$field]+_}" ]]; then
+    echo "Error: Unknown field '$field'" >&2
+    echo "Available fields:" >&2
+    list_fields >&2
+    return 1
+  fi
+  
+  local jq_expr="${FIELDS[$field]}"
+  local found=0
+  
+  while IFS= read -r -d '' file; do
+    # Extract the field value from this file
+    local file_value
+    file_value=$(jq -r "$jq_expr" "$file" 2>/dev/null || echo "")
+    
+    # Check if it matches (case-insensitive for some fields, exact for others)
+    if [[ -n "$file_value" && "$file_value" != "null" ]]; then
+      # For IPs and MACs, do case-insensitive comparison
+      if [[ "$field" == "ip" || "$field" == "mac" || "$field" == "public_ip" ]]; then
+        if [[ "${file_value,,}" == "${value,,}" ]]; then
+          found=$((found + 1))
+          local node
+          node=$(basename "$file" .json)
+          echo "${node}: ${file_value}"
+        fi
+      else
+        # For other fields, exact match
+        if [[ "$file_value" == "$value" ]]; then
+          found=$((found + 1))
+          local node
+          node=$(basename "$file" .json)
+          echo "${node}: ${file_value}"
+        fi
+      fi
+    fi
+  done < <(find "$MATCHBOX_DIR" -type f -name '*.json' -print0 2>/dev/null || true)
+  
+  if [[ $found -eq 0 ]]; then
+    echo "No nodes found with ${field}=${value}"
+    return 1
+  fi
+  
+  return 0
+}
+
+extract_field_value() {
+  local file="$1"
+  local jq_expr="$2"
+  local node="$3"
+  
+  # Try to extract the value
+  local result
+  result=$(jq -r "$jq_expr" "$file" 2>/dev/null || echo "")
+  
+  # Check if result is null, empty, or the string "null"
+  if [[ -z "$result" || "$result" == "null" ]]; then
+    echo "${node}: Not found"
+    return 1
+  fi
+  
+  echo "${node}: ${result}"
+  return 0
+}
+
+# ---- main ----
+if (( $# < 1 )) || [[ "${1:-}" == -* ]]; then usage; fi
+
+cmd_or_field="$(tr '[:upper:]' '[:lower:]' <<<"${1:-}")"
+case "$cmd_or_field" in
+  nut)
+    show_nut
+    exit 0
+    ;;
+  nauto|nautobot)
+    shift
+    # Pass all remaining arguments to gimme-nauto
+    exec ~/bin/gimme-nauto "$@"
+    ;;
+  list-fields)
+    list_fields
+    exit 0
+    ;;
+  where)
+    [[ $# -eq 2 ]] || usage
+    node="$2"
+    if file="$(find_json_for_node "$node")"; then
+      where_node "$file"
+      exit 0
+    else
+      echo "Error: Node '$node' not found under $MATCHBOX_DIR" >&2
+      exit 1
+    fi
+    ;;
+  hardware)
+    [[ $# -eq 2 ]] || usage
+    node="$2"
+    if file="$(find_json_for_node "$node")"; then
+      ssh_lshw "$file" "$node"
+      exit $?
+    else
+      echo "Error: Node '$node' not found under $MATCHBOX_DIR" >&2
+      exit 1
+    fi
+    ;;
+  status)
+    [[ $# -eq 2 ]] || usage
+    node="$2"
+    if file="$(find_json_for_node "$node")"; then
+      kubectl_status "$file" "$node"
+      exit $?
+    else
+      echo "Error: Node '$node' not found under $MATCHBOX_DIR" >&2
+      exit 1
+    fi
+    ;;
+  offline)
+    shift
+    # Check for --context flag
+    filter_context=""
+    if [[ "${1:-}" == "--context" ]]; then
+      [[ $# -ge 2 ]] || usage
+      filter_context="$2"
+      shift 2
+    fi
+    
+    kubectl_offline_scan "$filter_context"
+    exit $?
+    ;;
+  oldest)
+    shift
+    # Parse options
+    filter_context=""
+    limit=10
+    
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --context)
+          [[ $# -ge 2 ]] || usage
+          filter_context="$2"
+          shift 2
+          ;;
+        --limit)
+          [[ $# -ge 2 ]] || usage
+          limit="$2"
+          shift 2
+          ;;
+        *)
+          echo "Error: Unknown option '$1'" >&2
+          usage
+          ;;
+      esac
+    done
+    
+    kubectl_oldest_scan "$filter_context" "$limit"
+    exit $?
+    ;;
+  k8s|k8)
+    shift
+    # Check for --not flag
+    if [[ "${1:-}" == "--not" ]]; then
+      [[ $# -ge 2 ]] || usage
+      exclude_version="$2"
+      shift 2
+      
+      # Check for --context flag
+      filter_context=""
+      if [[ "${1:-}" == "--context" ]]; then
+        [[ $# -ge 2 ]] || usage
+        filter_context="$2"
+        shift 2
+      fi
+      
+      kubectl_k8s_scan "$exclude_version" "$filter_context"
+      exit $?
+    fi
+    
+    # Normal mode: check specific nodes
+    [[ $# -ge 1 ]] || usage
+    exit_code=0
+    for node in "$@"; do
+      if file="$(find_json_for_node "$node")"; then
+        kubectl_k8s_version "$file" "$node" || exit_code=1
+      else
+        echo "${node}: Node not found" >&2
+        exit_code=1
+      fi
+    done
+    exit $exit_code
+    ;;
+  search)
+    [[ $# -eq 2 ]] || usage
+    pattern="$2"
+    search_nodes "$pattern"
+    exit $?
+    ;;
+  find)
+    [[ $# -eq 3 ]] || usage
+    field="$2"
+    value="$3"
+    find_by_field "$field" "$value"
+    exit $?
+    ;;
+  *)
+    [[ $# -ge 2 ]] || usage
+    field="$cmd_or_field"
+    shift  # Remove the field argument, leaving just the nodes
+
+    # 'all' special case - only supports single node
+    if [[ "$field" == "all" ]]; then
+      [[ $# -eq 1 ]] || { echo "Error: 'all' command only supports one node at a time" >&2; exit 1; }
+      node="$1"
+      if file="$(find_json_for_node "$node")"; then
+        pretty_all "$file" "$node"
+        exit 0
+      else
+        echo "Error: Node '$node' not found under $MATCHBOX_DIR" >&2
+        exit 1
+      fi
+    fi
+
+    # Unknown field?
+    if [[ -z "${FIELDS[$field]+_}" ]]; then
+      echo "Unknown field: $field" >&2
+      echo ""
+      usage
+    fi
+
+    # Process multiple nodes
+    exit_code=0
+    for node in "$@"; do
+      if file="$(find_json_for_node "$node")"; then
+        extract_field_value "$file" "${FIELDS[$field]}" "$node" || exit_code=1
+      else
+        echo "${node}: Node not found" >&2
+        exit_code=1
+      fi
+    done
+    
+    exit $exit_code
+    ;;
+esac
