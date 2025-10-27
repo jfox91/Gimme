@@ -161,25 +161,51 @@ configure_nautobot() {
     echo -e "${YELLOW}=== Nautobot Configuration (Optional) ===${NC}"
     echo "Nautobot integration allows you to query device status, rack location, and notes."
     echo ""
-    
+
     if ! prompt_yn "Do you want to configure Nautobot integration?" "n"; then
         echo -e "${BLUE}  ⏭  Skipping Nautobot setup${NC}"
         return 0
     fi
-    
+
     echo ""
     local nautobot_url
     local nautobot_token
-    
+
     nautobot_url=$(prompt "Enter Nautobot URL (e.g., https://nautobot.example.com)")
-    
+
     if [ -z "$nautobot_url" ]; then
         echo -e "${YELLOW}  ⏭  Skipping Nautobot (no URL provided)${NC}"
         return 0
     fi
-    
-    nautobot_token=$(prompt "Enter Nautobot API token")
-    
+
+    echo ""
+    echo -e "${RED}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║              ⚠️  SECURITY REQUIREMENT  ⚠️                   ║${NC}"
+    echo -e "${RED}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}You MUST use a READ-ONLY API token for Nautobot.${NC}"
+    echo ""
+    echo "Why read-only?"
+    echo "  • Gimme only queries data, it never modifies anything"
+    echo "  • A read-only token limits security exposure"
+    echo "  • Follows the principle of least privilege"
+    echo ""
+    echo "How to create a read-only token in Nautobot:"
+    echo "  1. Go to your Nautobot instance"
+    echo "  2. Navigate to: Admin → Users → API Tokens"
+    echo "  3. Create a new token with ONLY read permissions"
+    echo "  4. Ensure write permissions are NOT granted"
+    echo ""
+
+    if ! prompt_yn "Do you confirm this is a READ-ONLY token?" "n"; then
+        echo -e "${RED}  ✗ Installation requires a read-only token${NC}"
+        echo -e "${YELLOW}  ⏭  Skipping Nautobot setup${NC}"
+        return 0
+    fi
+
+    echo ""
+    nautobot_token=$(prompt "Enter Nautobot READ-ONLY API token")
+
     if [ -z "$nautobot_token" ]; then
         echo -e "${YELLOW}  ⏭  Skipping Nautobot (no token provided)${NC}"
         return 0
