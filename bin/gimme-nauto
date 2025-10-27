@@ -6,7 +6,20 @@ Usage: gimme nauto <command> <device>
 
 import sys
 import os
-from pynautobot import api
+
+# Check for pynautobot before importing
+try:
+    from pynautobot import api
+except ImportError:
+    print("Error: pynautobot library not found", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Install it with:", file=sys.stderr)
+    print("  pip3 install --user --break-system-packages pynautobot", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Or run the setup wizard again:", file=sys.stderr)
+    print("  cd ~/Gimme && ./install.sh", file=sys.stderr)
+    sys.exit(1)
+
 import json
 
 # Configuration
@@ -64,7 +77,7 @@ def find_device(nb, device_name):
 
 def show_status(device, device_name):
     """Show device status, rack location, and notes"""
-    status = device.status if device.status else "Unknown"
+    status = str(device.status) if device.status else "Unknown"
     print(f"{device_name}: {status}")
     
     # Show rack location
@@ -89,25 +102,29 @@ def show_status(device, device_name):
         print(f"  Primary IP: {device.primary_ip4.address}")
     
     # Show model
-    if hasattr(device, 'device_type'):
+    if hasattr(device, 'device_type') and device.device_type:
         print(f"  Model: {device.device_type.model}")
     
     # Show role
-    if hasattr(device, 'device_role'):
+    if hasattr(device, 'device_role') and device.device_role:
         print(f"  Role: {device.device_role.name}")
     
     # Show notes/comments if any exist
     notes = None
-    if hasattr(device, 'comments') and device.comments:
-        notes = device.comments
-    elif hasattr(device, 'notes') and device.notes:
-        notes = device.notes
     
-    if notes:
+    # Try different possible note fields
+    if hasattr(device, 'comments') and device.comments:
+        notes = str(device.comments).strip()
+    elif hasattr(device, 'notes') and device.notes:
+        notes = str(device.notes).strip()
+    
+    # Only print notes if they actually have content
+    if notes and notes != "" and notes.lower() != "none":
         print(f"  Notes:")
         # Handle multi-line notes with proper indentation
-        for line in notes.strip().split('\n'):
-            print(f"    {line}")
+        for line in notes.split('\n'):
+            if line.strip():  # Only print non-empty lines
+                print(f"    {line}")
 
 def show_info(device, device_name):
     """Show full device info"""
@@ -124,11 +141,11 @@ def show_info(device, device_name):
     if hasattr(device, 'position') and device.position:
         print(f"  Position: {device.position}")
     
-    if hasattr(device, 'device_type'):
+    if hasattr(device, 'device_type') and device.device_type:
         print(f"  Manufacturer: {device.device_type.manufacturer.name}")
         print(f"  Model: {device.device_type.model}")
     
-    if hasattr(device, 'device_role'):
+    if hasattr(device, 'device_role') and device.device_role:
         print(f"  Role: {device.device_role.name}")
     
     if hasattr(device, 'serial') and device.serial:
@@ -147,7 +164,9 @@ def show_info(device, device_name):
         print(f"  Platform: {device.platform.name}")
     
     if hasattr(device, 'comments') and device.comments:
-        print(f"  Comments: {device.comments}")
+        comments = str(device.comments).strip()
+        if comments and comments.lower() != "none":
+            print(f"  Comments: {comments}")
 
 def show_location(device, device_name):
     """Show device location"""
